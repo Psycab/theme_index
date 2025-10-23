@@ -29,6 +29,39 @@ class ScoringSystem:
         
         self.final_scores = {}
         self.scoring_metadata = {}
+        self.company_info = {}  # 기업 정보 저장 (symbol -> name 매핑)
+        
+    def set_company_info(self, companies: List[Dict]):
+        """기업 정보 설정"""
+        self.company_info = {}
+        for company in companies:
+            if isinstance(company, dict):
+                symbol = company.get('symbol', '')
+                name = company.get('name', '')
+                if symbol:
+                    self.company_info[symbol] = {
+                        'name': name,
+                        'sector': company.get('sector', ''),
+                        'industry': company.get('industry', ''),
+                        'market_cap': company.get('market_cap', None)
+                    }
+            else:
+                # Company 객체인 경우
+                symbol = getattr(company, 'symbol', '')
+                name = getattr(company, 'name', '')
+                if symbol:
+                    self.company_info[symbol] = {
+                        'name': name,
+                        'sector': getattr(company, 'sector', ''),
+                        'industry': getattr(company, 'industry', ''),
+                        'market_cap': getattr(company, 'market_cap', None)
+                    }
+        
+        logger.info(f"기업 정보 설정 완료: {len(self.company_info)}개 기업")
+        
+    def get_company_name(self, symbol: str) -> str:
+        """기업 심볼로부터 한글명 조회"""
+        return self.company_info.get(symbol, {}).get('name', symbol)
         
     def calculate_bm25_scores(self, documents: List[Dict]) -> Dict[str, Dict[str, float]]:
         """BM25 스코어 계산"""
@@ -201,15 +234,23 @@ class ScoringSystem:
         return filtered_companies
     
     def generate_scoring_results(self, documents: List[Dict]) -> Dict:
-        """전체 스코어링 결과 생성"""
+        """전체 스코어링 결과 생성 (Outer Join 방식)"""
         logger.info("스코어링 결과 생성 시작")
         
-        # 문서 수 기준 기업 필터링
+        # 모든 기업 목록 가져오기 (Outer Join을 위해)
+        all_companies = set(self.company_info.keys())
+        
+        # 문서 수 기준 기업 필터링 (참고용)
         valid_companies = self.filter_companies_by_document_count(documents)
         
-        if not valid_companies:
-            logger.error("유효한 기업이 없습니다")
-            return {}
+        if not documents:
+            logger.warning("문서가 없습니다. 모든 기업의 점수를 0으로 설정합니다.")
+            # 모든 기업의 점수를 0으로 설정
+            zero_scores = {}
+            for company_symbol in all_companies:
+                zero_scores[company_symbol] = {keyword: 0.0 for keyword in self.target_keywords}
+            
+            return self._create_results_with_all_companies(zero_scores, valid_companies, documents)
         
         # BM25 스코어 계산
         bm25_scores = self.calculate_bm25_scores(documents)
@@ -220,39 +261,56 @@ class ScoringSystem:
         # 최종 통합 스코어 계산
         final_scores = self.calculate_final_scores(bm25_scores, topic_scores)
         
-        # 유효한 기업만 필터링
-        filtered_final_scores = {
-            company: scores for company, scores in final_scores.items()
-            if company in valid_companies
-        }
+        # Outer Join: 모든 기업을 포함하되, 데이터가 없는 기업은 0점으로 설정
+        all_company_scores = {}
+        for company_symbol in all_companies:
+            if company_symbol in final_scores:
+                # 데이터가 있는 기업
+                all_company_scores[company_symbol] = final_scores[company_symbol]
+            else:
+                # 데이터가 없는 기업 (0점으로 설정)
+                all_company_scores[company_symbol] = {
+                    keyword: 0.0 for keyword in self.target_keywords
+                }
         
         # 결과 구성
-        results = {
+        results = self._create_results_with_all_companies(all_company_scores, valid_companies, documents)
+        
+        self.final_scores = all_company_scores
+        self.scoring_metadata = results
+        
+        logger.info("스코어링 결과 생성 완료")
+        return results
+    
+    def _create_results_with_all_companies(self, all_company_scores: Dict, valid_companies: Dict, documents: List[Dict]) -> Dict:
+        """모든 기업을 포함한 결과 생성"""
+        return {
             'scoring_date': datetime.now().isoformat(),
             'data_period': f"{self.config.rebalancing_months}개월",
-            'total_companies': len(valid_companies),
+            'total_companies': len(all_company_scores),
+            'companies_with_data': len(valid_companies),
+            'companies_without_data': len(all_company_scores) - len(valid_companies),
             'total_documents': len(documents),
             'target_keywords': self.target_keywords,
             'scoring_weights': {
                 'bm25_weight': self.bm25_weight,
                 'topic_weight': self.topic_weight
             },
-            'company_scores': filtered_final_scores,
-            'bm25_scores': bm25_scores,
-            'topic_scores': topic_scores,
+            'company_scores': all_company_scores,
             'company_document_counts': valid_companies,
-            'top_companies_per_keyword': self._get_top_companies_per_keyword(filtered_final_scores),
+            'top_companies_per_keyword': self._get_top_companies_per_keyword(all_company_scores),
+            'data_availability': {
+                'companies_with_data': list(valid_companies.keys()),
+                'companies_without_data': [
+                    company for company in all_company_scores.keys() 
+                    if company not in valid_companies
+                ]
+            },
             'model_statistics': {
-                'bm25_stats': self.bm25_scorer.get_statistics(),
-                'topic_stats': self.topic_modeler.get_model_statistics()
+                'bm25_stats': self.bm25_scorer.get_statistics() if hasattr(self.bm25_scorer, 'get_statistics') else {},
+                'topic_stats': self.topic_modeler.get_model_statistics() if hasattr(self.topic_modeler, 'get_model_statistics') else {}
             }
         }
-        
-        self.final_scores = filtered_final_scores
-        self.scoring_metadata = results
-        
-        logger.info("스코어링 결과 생성 완료")
-        return results
     
     def _get_top_companies_per_keyword(self, scores: Dict[str, Dict[str, float]], 
                                      top_k: int = 10) -> Dict[str, List[Dict]]:
@@ -281,13 +339,16 @@ class ScoringSystem:
         """결과 저장"""
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         
+        # 키워드 정보를 파일명에 포함
+        keyword_info = self._create_keyword_filename_suffix()
+        
         # 실행 폴더와 기간 폴더 설정
         if execution_folder and period_folder:
             base_path = f"results/{execution_folder}/{period_folder}"
             os.makedirs(base_path, exist_ok=True)
-            file_prefix = f"{base_path}/{filename_prefix}"
+            file_prefix = f"{base_path}/{filename_prefix}_{keyword_info}"
         else:
-            file_prefix = filename_prefix
+            file_prefix = f"{filename_prefix}_{keyword_info}"
         
         # JSON 형태로 전체 결과 저장
         json_filename = f"{file_prefix}_{timestamp}.json"
@@ -333,7 +394,10 @@ class ScoringSystem:
         """기업별 스코어를 CSV로 저장"""
         rows = []
         for company_symbol, scores in company_scores.items():
-            row = {'company_symbol': company_symbol}
+            row = {
+                'company_symbol': company_symbol,
+                'company_name': self.get_company_name(company_symbol)
+            }
             row.update(scores)
             rows.append(row)
         
@@ -349,6 +413,7 @@ class ScoringSystem:
                     'keyword': keyword,
                     'rank': rank,
                     'company_symbol': company['company_symbol'],
+                    'company_name': self.get_company_name(company['company_symbol']),
                     'score': company['score']
                 })
         
@@ -361,10 +426,16 @@ class ScoringSystem:
             with pd.ExcelWriter(filename, engine='openpyxl') as writer:
                 # 1. 기업별 스코어 시트
                 if 'company_scores' in results:
-                    company_scores_df = pd.DataFrame([
-                        {'company_symbol': company, **scores}
-                        for company, scores in results['company_scores'].items()
-                    ])
+                    company_scores_data = []
+                    for company, scores in results['company_scores'].items():
+                        row = {
+                            'company_symbol': company,
+                            'company_name': self.get_company_name(company),
+                            **scores
+                        }
+                        company_scores_data.append(row)
+                    
+                    company_scores_df = pd.DataFrame(company_scores_data)
                     company_scores_df.to_excel(writer, sheet_name='Company_Scores', index=False)
                 
                 # 2. 키워드별 순위 시트
@@ -376,6 +447,7 @@ class ScoringSystem:
                                 'keyword': keyword,
                                 'rank': rank,
                                 'company_symbol': company['company_symbol'],
+                                'company_name': self.get_company_name(company['company_symbol']),
                                 'score': company['score']
                             })
                     
@@ -393,6 +465,8 @@ class ScoringSystem:
                     {'항목': '스코어링 날짜', '값': results.get('scoring_date', '')},
                     {'항목': '데이터 기간', '값': results.get('data_period', '')},
                     {'항목': '총 기업 수', '값': results.get('total_companies', 0)},
+                    {'항목': '데이터 보유 기업 수', '값': results.get('companies_with_data', 0)},
+                    {'항목': '데이터 미보유 기업 수', '값': results.get('companies_without_data', 0)},
                     {'항목': '총 문서 수', '값': results.get('total_documents', 0)},
                     {'항목': 'BM25 가중치', '값': results.get('scoring_weights', {}).get('bm25_weight', 0)},
                     {'항목': '토픽 가중치', '값': results.get('scoring_weights', {}).get('topic_weight', 0)},
@@ -408,12 +482,224 @@ class ScoringSystem:
                         'rank': range(1, len(results['target_keywords']) + 1)
                     })
                     keywords_df.to_excel(writer, sheet_name='Target_Keywords', index=False)
+                
+                # 6. 데이터 가용성 시트
+                self._create_data_availability_sheet(writer, results)
+                
+                # 7. 키워드별 파생 키워드 분석 시트
+                self._create_keyword_analysis_sheet(writer, results)
             
             logger.info(f"Excel 파일 저장 완료: {filename}")
             
         except Exception as e:
             logger.error(f"Excel 저장 중 오류: {str(e)}")
             raise
+    
+    def _create_data_availability_sheet(self, writer, results: Dict):
+        """데이터 가용성 시트 생성"""
+        try:
+            logger.info("데이터 가용성 시트 생성 시작")
+            
+            # 데이터 보유 기업 목록
+            companies_with_data = results.get('data_availability', {}).get('companies_with_data', [])
+            companies_without_data = results.get('data_availability', {}).get('companies_without_data', [])
+            
+            # 데이터 보유 기업 정보
+            with_data_rows = []
+            for company_symbol in companies_with_data:
+                doc_count = results.get('company_document_counts', {}).get(company_symbol, 0)
+                with_data_rows.append({
+                    'company_symbol': company_symbol,
+                    'company_name': self.get_company_name(company_symbol),
+                    'document_count': doc_count,
+                    'data_status': '보유'
+                })
+            
+            # 데이터 미보유 기업 정보
+            without_data_rows = []
+            for company_symbol in companies_without_data:
+                without_data_rows.append({
+                    'company_symbol': company_symbol,
+                    'company_name': self.get_company_name(company_symbol),
+                    'document_count': 0,
+                    'data_status': '미보유'
+                })
+            
+            # 통합 데이터
+            all_data_rows = with_data_rows + without_data_rows
+            
+            if all_data_rows:
+                availability_df = pd.DataFrame(all_data_rows)
+                availability_df.to_excel(writer, sheet_name='Data_Availability', index=False)
+                logger.info(f"데이터 가용성 시트 생성 완료: {len(all_data_rows)}개 기업")
+            
+        except Exception as e:
+            logger.error(f"데이터 가용성 시트 생성 실패: {str(e)}")
+    
+    def _create_keyword_analysis_sheet(self, writer, results: Dict):
+        """키워드별 파생 키워드 분석 시트 생성"""
+        try:
+            logger.info("키워드별 파생 키워드 분석 시트 생성 시작")
+            
+            # 키워드별 파생 키워드 정보 생성
+            keyword_analysis_data = []
+            
+            for keyword in self.target_keywords:
+                # 파생 키워드 가져오기
+                related_keywords = self._get_related_keywords(keyword)
+                
+                # 키워드 패턴 파일에서 더 상세한 파생 키워드 가져오기
+                detailed_keywords = self._get_detailed_keywords(keyword)
+                
+                # 토픽 매핑 정보 가져오기
+                topic_mapping = self._create_keyword_topic_mapping()
+                mapped_topics = topic_mapping.get(keyword, [])
+                
+                # 키워드별 상위 기업 정보
+                top_companies = results.get('top_companies_per_keyword', {}).get(keyword, [])
+                top_company_count = len(top_companies)
+                avg_score = np.mean([c['score'] for c in top_companies]) if top_companies else 0.0
+                
+                keyword_analysis_data.append({
+                    'main_keyword': keyword,
+                    'related_keywords_count': len(related_keywords),
+                    'detailed_keywords_count': len(detailed_keywords),
+                    'mapped_topics_count': len(mapped_topics),
+                    'top_companies_count': top_company_count,
+                    'average_score': round(avg_score, 3),
+                    'related_keywords': ', '.join(related_keywords[:10]),  # 처음 10개만 표시
+                    'detailed_keywords': ', '.join(detailed_keywords[:10]),  # 처음 10개만 표시
+                    'mapped_topics': ', '.join(mapped_topics[:5])  # 처음 5개만 표시
+                })
+            
+            # DataFrame 생성 및 저장
+            analysis_df = pd.DataFrame(keyword_analysis_data)
+            analysis_df.to_excel(writer, sheet_name='Keyword_Analysis', index=False)
+            
+            # 키워드별 상세 파생 키워드 시트들 생성
+            for keyword in self.target_keywords:
+                self._create_detailed_keyword_sheet(writer, keyword, results)
+            
+            logger.info("키워드별 파생 키워드 분석 시트 생성 완료")
+            
+        except Exception as e:
+            logger.error(f"키워드 분석 시트 생성 실패: {str(e)}")
+    
+    def _get_detailed_keywords(self, keyword: str) -> List[str]:
+        """키워드 패턴 파일에서 상세한 파생 키워드 가져오기"""
+        try:
+            # 키워드 패턴 파일 읽기
+            pattern_file = "data/keyword_patterns.txt"
+            if os.path.exists(pattern_file):
+                with open(pattern_file, 'r', encoding='utf-8') as f:
+                    lines = f.readlines()
+                
+                for line in lines:
+                    if line.strip() and not line.startswith('#'):
+                        parts = line.strip().split(':')
+                        if len(parts) == 2 and parts[0] == keyword:
+                            return [k.strip() for k in parts[1].split(',') if k.strip()]
+            
+            # 파일이 없거나 키워드가 없으면 기본 관련 키워드 반환
+            return self._get_related_keywords(keyword)
+            
+        except Exception as e:
+            logger.error(f"상세 키워드 가져오기 실패: {str(e)}")
+            return self._get_related_keywords(keyword)
+    
+    def _create_detailed_keyword_sheet(self, writer, keyword: str, results: Dict):
+        """키워드별 상세 파생 키워드 시트 생성"""
+        try:
+            # 파생 키워드들 가져오기
+            related_keywords = self._get_related_keywords(keyword)
+            detailed_keywords = self._get_detailed_keywords(keyword)
+            
+            # 토픽 매핑 정보
+            topic_mapping = self._create_keyword_topic_mapping()
+            mapped_topics = topic_mapping.get(keyword, [])
+            
+            # 키워드별 상위 기업 정보
+            top_companies = results.get('top_companies_per_keyword', {}).get(keyword, [])
+            
+            # 상세 정보 데이터 생성
+            detailed_data = []
+            
+            # 파생 키워드 정보
+            for i, related_kw in enumerate(related_keywords):
+                detailed_data.append({
+                    'category': 'Related Keywords',
+                    'keyword': related_kw,
+                    'rank': i + 1,
+                    'description': f'{keyword} 관련 키워드',
+                    'type': 'Derived'
+                })
+            
+            # 상세 파생 키워드 정보 (중복 제거)
+            for i, detailed_kw in enumerate(detailed_keywords):
+                if detailed_kw not in related_keywords:  # 중복 제거
+                    detailed_data.append({
+                        'category': 'Detailed Keywords',
+                        'keyword': detailed_kw,
+                        'rank': len(related_keywords) + i + 1,
+                        'description': f'{keyword} 상세 관련 키워드',
+                        'type': 'Detailed'
+                    })
+            
+            # 토픽 매핑 정보
+            for i, topic in enumerate(mapped_topics):
+                detailed_data.append({
+                    'category': 'Mapped Topics',
+                    'keyword': topic,
+                    'rank': i + 1,
+                    'description': f'{keyword}와 매핑된 토픽',
+                    'type': 'Topic'
+                })
+            
+            # 상위 기업 정보
+            for i, company in enumerate(top_companies[:10]):  # 상위 10개만
+                detailed_data.append({
+                    'category': 'Top Companies',
+                    'keyword': company['company_symbol'],
+                    'company_name': self.get_company_name(company['company_symbol']),
+                    'rank': i + 1,
+                    'description': f'{keyword} 관련 상위 기업',
+                    'type': 'Company',
+                    'score': company['score']
+                })
+            
+            # DataFrame 생성 및 저장
+            if detailed_data:
+                detailed_df = pd.DataFrame(detailed_data)
+                # 시트명 생성 (Excel 시트명 제한 고려)
+                sheet_name = f"KW_{keyword}"[:31]
+                detailed_df.to_excel(writer, sheet_name=sheet_name, index=False)
+            
+        except Exception as e:
+            logger.error(f"키워드 {keyword} 상세 시트 생성 실패: {str(e)}")
+    
+    def _create_keyword_filename_suffix(self) -> str:
+        """키워드 정보를 파일명 접미사로 생성"""
+        try:
+            if not self.target_keywords:
+                return "no_keywords"
+            
+            # 키워드 개수에 따라 접미사 생성
+            if len(self.target_keywords) == 1:
+                # 단일 키워드인 경우
+                keyword = self.target_keywords[0]
+                return f"KW_{keyword}"
+            elif len(self.target_keywords) <= 3:
+                # 3개 이하인 경우 모든 키워드 포함
+                keywords_str = "_".join(self.target_keywords)
+                return f"KW_{keywords_str}"
+            else:
+                # 3개 초과인 경우 첫 3개만 포함하고 개수 표시
+                first_three = "_".join(self.target_keywords[:3])
+                return f"KW_{first_three}_and_{len(self.target_keywords)-3}more"
+                
+        except Exception as e:
+            logger.error(f"키워드 파일명 접미사 생성 실패: {str(e)}")
+            return "keywords_error"
     
     def get_rebalancing_recommendations(self, top_n: int = 50) -> List[Dict]:
         """리밸런싱 추천 기업 반환"""
@@ -429,6 +715,7 @@ class ScoringSystem:
             avg_score = np.mean(list(scores.values()))
             company_avg_scores.append({
                 'company_symbol': company_symbol,
+                'company_name': self.get_company_name(company_symbol),
                 'average_score': avg_score,
                 'max_score': max(scores.values()),
                 'keyword_count': len([s for s in scores.values() if s > 0.1])

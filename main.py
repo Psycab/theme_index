@@ -25,7 +25,7 @@ from src.period_execution_manager import PeriodExecutionManager
 
 # 로깅 설정
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,  # DEBUG 레벨로 변경하여 더 자세한 정보 확인
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler('logs/scoring_system.log', encoding='utf-8'),
@@ -47,6 +47,11 @@ class SystemConfig:
     bm25_weight: float = 0.6
     topic_weight: float = 0.4
     min_documents_per_company: int = 5
+    
+    # GPU OCR 설정
+    use_gpu_ocr: bool = True
+    gpu_ocr_method: str = 'easyocr'
+    pdf_cache_dir: str = "cache/pdf_cache"
     
     def __post_init__(self):
         if self.target_keywords is None:
@@ -74,7 +79,14 @@ def run_period_execution(execution_name: str, start_date: str, end_date: str,
         
         # 시스템 컴포넌트 초기화
         api_client = DeepSearchClient(config)
-        pdf_processor = PDFProcessor()
+        
+        # GPU OCR 설정을 사용한 PDF 프로세서 초기화
+        pdf_processor = PDFProcessor(
+            cache_dir=config.pdf_cache_dir,
+            use_gpu=config.use_gpu_ocr,
+            gpu_ocr_method=config.gpu_ocr_method
+        )
+        
         text_preprocessor = TextPreprocessor()
         bm25_scorer = BM25Scorer()
         topic_modeler = TopicModeler()

@@ -53,10 +53,23 @@ class DeepSearchClient:
             url = f"{self.base_url}{endpoint}"
             params['api_key'] = self.api_key
             
+            logger.debug(f"API 요청: {url}")
+            logger.debug(f"요청 파라미터: {params}")
+            
             response = self.session.get(url, params=params, timeout=30)
+            
+            logger.debug(f"응답 상태 코드: {response.status_code}")
+            
+            if response.status_code != 200:
+                logger.error(f"API 응답 오류: {response.status_code} - {response.text}")
+                return None
+                
             response.raise_for_status()
             
-            return response.json()
+            data = response.json()
+            logger.debug(f"응답 데이터 크기: {len(str(data))} 문자")
+            
+            return data
             
         except requests.exceptions.RequestException as e:
             logger.error(f"API 요청 실패: {endpoint}, 오류: {str(e)}")
@@ -68,6 +81,7 @@ class DeepSearchClient:
     def get_all_companies(self) -> List[Company]:
         """국내 상장기업 전체 목록 조회"""
         logger.info("국내 상장기업 목록 조회 시작")
+        logger.info(f"API 설정: base_url={self.base_url}, country_code={self.country_code}")
         
         companies = []
         page = 1
@@ -80,11 +94,17 @@ class DeepSearchClient:
             }
             
             data = self._make_request('/v2/companies', params)
-            if not data or 'companies' not in data:
+            if not data:
+                logger.error(f"페이지 {page}에서 데이터 조회 실패")
                 break
                 
-            company_list = data['companies']
+            if 'data' not in data or 'companies' not in data['data']:
+                logger.error(f"페이지 {page}에서 'data.companies' 키가 없음. 응답: {data}")
+                break
+                
+            company_list = data['data']['companies']
             if not company_list:
+                logger.info(f"페이지 {page}에서 더 이상 기업이 없음")
                 break
                 
             for company_data in company_list:
@@ -138,24 +158,52 @@ class DeepSearchClient:
             }
             
             data = self._make_request('/v1/articles/documents/research', params)
-            if not data or 'documents' not in data:
-                logger.warning(f"배치 {i//batch_size + 1} 문서 조회 실패")
+            if not data:
+                logger.warning(f"배치 {i//batch_size + 1} 문서 조회 실패 - 응답 없음")
                 continue
             
-            document_list = data['documents']
+            # API 응답 구조 디버깅
+            logger.debug(f"API 응답 구조: {list(data.keys()) if isinstance(data, dict) else 'Not a dict'}")
+            
+            # 다양한 가능한 응답 구조 확인
+            document_list = None
+            if 'data' in data and isinstance(data['data'], list):
+                document_list = data['data']
+            elif 'documents' in data:
+                document_list = data['documents']
+            elif 'data' in data and 'documents' in data['data']:
+                document_list = data['data']['documents']
+            elif isinstance(data, list):
+                document_list = data
+            else:
+                logger.warning(f"배치 {i//batch_size + 1} 문서 조회 실패 - 알 수 없는 응답 구조: {data}")
+                continue
             for doc_data in document_list:
                 try:
                     # 심볼에서 KRX: prefix 제거
                     symbol = doc_data.get('symbol', '').replace('KRX:', '')
                     
+                    # 날짜 파싱 (published_at 또는 publish_date 사용)
+                    publish_date_str = doc_data.get('published_at', '') or doc_data.get('publish_date', '')
+                    if publish_date_str:
+                        try:
+                            publish_date = datetime.fromisoformat(publish_date_str.replace('Z', '+00:00'))
+                        except ValueError:
+                            logger.warning(f"날짜 파싱 실패: {publish_date_str}, 기본값 사용")
+                            publish_date = datetime.now()
+                    else:
+                        logger.warning(f"발행일 정보 없음, 기본값 사용")
+                        publish_date = datetime.now()
+                    
+                    # URL 처리 (content_url 우선 사용)
+                    document_url = doc_data.get('content_url', '') or doc_data.get('url', '')
+                    
                     document = Document(
                         document_id=doc_data.get('id', ''),
                         title=doc_data.get('title', ''),
-                        url=doc_data.get('url', ''),
+                        url=document_url,
                         company_symbol=symbol,
-                        publish_date=datetime.fromisoformat(
-                            doc_data.get('publish_date', '').replace('Z', '+00:00')
-                        ),
+                        publish_date=publish_date,
                         document_type=doc_data.get('type', 'research')
                     )
                     documents.append(document)

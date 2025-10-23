@@ -10,6 +10,8 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Tuple, Optional
 import json
 from collections import defaultdict
+import time
+from tqdm import tqdm
 from src.performance_optimizer import PerformanceOptimizer, performance_timer
 
 logger = logging.getLogger(__name__)
@@ -41,6 +43,18 @@ class PeriodExecutionManager:
         else:
             self.optimizer = None
             logger.info("시점별 실행 관리자 기본 모드")
+        
+        # 실행 통계 초기화
+        self.execution_stats = {
+            'total_periods': 0,
+            'completed_periods': 0,
+            'failed_periods': 0,
+            'start_time': None,
+            'end_time': None,
+            'total_execution_time': 0,
+            'period_times': {},  # 각 시점별 실행 시간
+            'step_times': {}     # 각 단계별 실행 시간
+        }
         
         logger.info(f"시점별 실행 관리자 초기화: {self.execution_name}")
         logger.info(f"실행 기간: {start_date} ~ {end_date}")
@@ -100,12 +114,17 @@ class PeriodExecutionManager:
     @performance_timer
     def execute_period(self, period_name: str, start_date: str, end_date: str, 
                       scoring_system, api_client, pdf_processor, text_preprocessor) -> Dict:
-        """특정 시점 실행 (성능 최적화)"""
-        logger.info(f"시점 실행 시작: {period_name} ({start_date} ~ {end_date})")
+        """특정 시점 실행 (성능 최적화 + 단계별 시간 측정)"""
+        logger.info(f"🔄 시점 실행 시작: {period_name} ({start_date} ~ {end_date})")
+        
+        # 단계별 시간 측정을 위한 딕셔너리
+        step_times = {}
+        period_start_time = time.time()
         
         try:
             # 1. 데이터 수집
-            logger.info("1단계: 데이터 수집")
+            step_start = time.time()
+            logger.info("📊 1단계: 데이터 수집")
             start_dt = datetime.strptime(start_date, '%Y-%m-%d')
             end_dt = datetime.strptime(end_date, '%Y-%m-%d')
             
@@ -139,12 +158,19 @@ class PeriodExecutionManager:
                     'document_type': doc.document_type
                 })
             
-            # 성능 최적화 사용 여부에 따라 다른 방법 선택
-            if self.use_optimization and self.optimizer:
+            # 고성능 PDF 추출 사용
+            if hasattr(pdf_processor, 'high_performance_batch_extract'):
+                # 새로운 고성능 메서드 사용
+                extracted_texts = pdf_processor.high_performance_batch_extract(
+                    doc_dicts, max_workers=None, batch_size=50
+                )
+            elif self.use_optimization and self.optimizer:
+                # 기존 최적화 메서드 사용
                 extracted_texts = self.optimizer.parallel_extract_texts(
                     doc_dicts, pdf_processor, batch_size=20
                 )
             else:
+                # 기본 메서드 사용
                 extracted_texts = pdf_processor.batch_extract_texts(doc_dicts)
             
             logger.info(f"텍스트 추출 완료: {len(extracted_texts)}개")
@@ -164,6 +190,10 @@ class PeriodExecutionManager:
             
             # 4. 스코어링 실행
             logger.info("4단계: 스코어링 실행")
+            
+            # 기업 정보를 스코어링 시스템에 설정
+            scoring_system.set_company_info(companies)
+            
             results = scoring_system.generate_scoring_results(processed_documents)
             
             if not results:
@@ -202,45 +232,142 @@ class PeriodExecutionManager:
             return None
     
     def execute_all_periods(self, scoring_system, api_client, pdf_processor, text_preprocessor):
-        """모든 시점 실행"""
-        logger.info("전체 시점 실행 시작")
+        """모든 시점 실행 (진행률 표시 및 시간 측정 포함)"""
+        logger.info("🚀 전체 시점 실행 시작")
+        
+        # 실행 시작 시간 기록
+        self.execution_stats['start_time'] = time.time()
         
         periods = self.generate_periods()
+        self.execution_stats['total_periods'] = len(periods)
         
-        for period_name, start_date, end_date in periods:
-            execution_info = self.execute_period(
-                period_name, start_date, end_date,
-                scoring_system, api_client, pdf_processor, text_preprocessor
-            )
+        print(f"\n📊 실행 계획:")
+        print(f"   • 총 시점 수: {len(periods)}개")
+        print(f"   • 실행 기간: {self.start_date.strftime('%Y-%m-%d')} ~ {self.end_date.strftime('%Y-%m-%d')}")
+        print(f"   • 리밸런싱 주기: {self.rebalancing_months}개월")
+        print(f"   • 예상 실행 시간: {len(periods) * 15}~{len(periods) * 25}분")
+        print()
+        
+        # 진행률 표시기로 시점별 실행
+        with tqdm(total=len(periods), desc="시점별 실행", unit="시점", 
+                  bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]") as pbar:
             
-            if execution_info:
-                logger.info(f"시점 {period_name} 완료")
-            else:
-                logger.error(f"시점 {period_name} 실패")
+            for i, (period_name, start_date, end_date) in enumerate(periods, 1):
+                period_start_time = time.time()
+                
+                # 현재 시점 정보 표시
+                pbar.set_description(f"시점 {i}/{len(periods)}: {period_name}")
+                
+                execution_info = self.execute_period(
+                    period_name, start_date, end_date,
+                    scoring_system, api_client, pdf_processor, text_preprocessor
+                )
+                
+                period_end_time = time.time()
+                period_duration = period_end_time - period_start_time
+                
+                # 시점별 실행 시간 기록
+                self.execution_stats['period_times'][period_name] = period_duration
+                
+                if execution_info:
+                    self.execution_stats['completed_periods'] += 1
+                    pbar.set_postfix({
+                        '상태': '완료',
+                        '소요시간': f"{period_duration:.1f}초",
+                        '완료율': f"{self.execution_stats['completed_periods']}/{self.execution_stats['total_periods']}"
+                    })
+                    logger.info(f"✅ 시점 {period_name} 완료 ({period_duration:.1f}초)")
+                else:
+                    self.execution_stats['failed_periods'] += 1
+                    pbar.set_postfix({
+                        '상태': '실패',
+                        '소요시간': f"{period_duration:.1f}초",
+                        '완료율': f"{self.execution_stats['completed_periods']}/{self.execution_stats['total_periods']}"
+                    })
+                    logger.error(f"❌ 시점 {period_name} 실패 ({period_duration:.1f}초)")
+                
+                pbar.update(1)
+        
+        # 실행 종료 시간 기록
+        self.execution_stats['end_time'] = time.time()
+        self.execution_stats['total_execution_time'] = self.execution_stats['end_time'] - self.execution_stats['start_time']
+        
+        # 실행 결과 요약 출력
+        self._print_execution_summary()
         
         # 통합 Excel 파일 생성
+        logger.info("📊 통합 Excel 파일 생성 중...")
+        excel_start_time = time.time()
         self.create_consolidated_excel()
+        excel_duration = time.time() - excel_start_time
+        logger.info(f"✅ 통합 Excel 파일 생성 완료 ({excel_duration:.1f}초)")
         
         # 실행 요약 저장
+        logger.info("💾 실행 요약 저장 중...")
         self.save_execution_summary()
         
-        logger.info("전체 시점 실행 완료")
+        logger.info("🎉 전체 시점 실행 완료")
+    
+    def _print_execution_summary(self):
+        """실행 결과 요약 출력"""
+        total_time = self.execution_stats['total_execution_time']
+        completed = self.execution_stats['completed_periods']
+        failed = self.execution_stats['failed_periods']
+        total = self.execution_stats['total_periods']
+        
+        print(f"\n{'='*60}")
+        print(f"📊 실행 결과 요약")
+        print(f"{'='*60}")
+        print(f"총 실행 시간: {total_time/60:.1f}분 ({total_time:.1f}초)")
+        print(f"완료된 시점: {completed}/{total} ({completed/total*100:.1f}%)")
+        print(f"실패한 시점: {failed}/{total} ({failed/total*100:.1f}%)")
+        
+        if self.execution_stats['period_times']:
+            avg_time = sum(self.execution_stats['period_times'].values()) / len(self.execution_stats['period_times'])
+            print(f"평균 시점 실행 시간: {avg_time:.1f}초")
+            
+            # 가장 빠른/느린 시점
+            fastest_period = min(self.execution_stats['period_times'].items(), key=lambda x: x[1])
+            slowest_period = max(self.execution_stats['period_times'].items(), key=lambda x: x[1])
+            print(f"가장 빠른 시점: {fastest_period[0]} ({fastest_period[1]:.1f}초)")
+            print(f"가장 느린 시점: {slowest_period[0]} ({slowest_period[1]:.1f}초)")
+        
+        print(f"{'='*60}")
     
     def create_consolidated_excel(self):
         """시점별 통합 Excel 파일 생성"""
         logger.info("통합 Excel 파일 생성 시작")
         
-        excel_file = f"{self.results_base_path}/consolidated_results.xlsx"
+        # 키워드 정보를 파일명에 포함
+        keyword_info = self._create_keyword_filename_suffix()
+        excel_file = f"{self.results_base_path}/consolidated_results_{keyword_info}.xlsx"
         
         try:
-            with pd.ExcelWriter(excel_file, engine='openpyxl') as writer:
+            # openpyxl 엔진 사용 가능 여부 확인
+            try:
+                import openpyxl
+                engine = 'openpyxl'
+                logger.info("openpyxl 엔진 사용")
+            except ImportError:
+                logger.warning("openpyxl 사용 불가, 기본 엔진 사용")
+                engine = None
+            
+            with pd.ExcelWriter(excel_file, engine=engine) as writer:
                 # 1. 시점별 기업 스코어 시트들
                 for period_name, results in self.all_results.items():
                     if 'company_scores' in results:
-                        company_scores_df = pd.DataFrame([
-                            {'company_symbol': company, **scores}
-                            for company, scores in results['company_scores'].items()
-                        ])
+                        company_scores_data = []
+                        for company, scores in results['company_scores'].items():
+                            # 기업명 조회 (기업 정보가 있는 경우)
+                            company_name = self._get_company_name(company)
+                            row = {
+                                'company_symbol': company,
+                                'company_name': company_name,
+                                **scores
+                            }
+                            company_scores_data.append(row)
+                        
+                        company_scores_df = pd.DataFrame(company_scores_data)
                         
                         # 시트명 생성 (Excel 시트명 제한 고려)
                         sheet_name = period_name.replace('period_', '').replace('_', '-')[:31]
@@ -334,6 +461,47 @@ class PeriodExecutionManager:
         
         except Exception as e:
             logger.error(f"기업 트렌드 시트 생성 실패: {str(e)}")
+    
+    def _create_keyword_filename_suffix(self) -> str:
+        """키워드 정보를 파일명 접미사로 생성"""
+        try:
+            # 첫 번째 실행에서 키워드 정보 가져오기
+            if self.period_executions:
+                first_execution = self.period_executions[0]
+                keywords = first_execution.get('target_keywords', [])
+                
+                if not keywords:
+                    return "no_keywords"
+                
+                # 키워드 개수에 따라 접미사 생성
+                if len(keywords) == 1:
+                    # 단일 키워드인 경우
+                    keyword = keywords[0]
+                    return f"KW_{keyword}"
+                elif len(keywords) <= 3:
+                    # 3개 이하인 경우 모든 키워드 포함
+                    keywords_str = "_".join(keywords)
+                    return f"KW_{keywords_str}"
+                else:
+                    # 3개 초과인 경우 첫 3개만 포함하고 개수 표시
+                    first_three = "_".join(keywords[:3])
+                    return f"KW_{first_three}_and_{len(keywords)-3}more"
+            else:
+                return "no_executions"
+                
+        except Exception as e:
+            logger.error(f"키워드 파일명 접미사 생성 실패: {str(e)}")
+            return "keywords_error"
+    
+    def _get_company_name(self, symbol: str) -> str:
+        """기업 심볼로부터 한글명 조회"""
+        if hasattr(self, '_companies') and self._companies:
+            for company in self._companies:
+                if hasattr(company, 'symbol') and company.symbol == symbol:
+                    return getattr(company, 'name', symbol)
+                elif isinstance(company, dict) and company.get('symbol') == symbol:
+                    return company.get('name', symbol)
+        return symbol
     
     def save_execution_summary(self):
         """실행 요약 저장"""

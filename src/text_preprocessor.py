@@ -6,12 +6,24 @@
 import logging
 import re
 import nltk
-from konlpy.tag import Okt, Kkma
 from typing import List, Dict, Set, Tuple
 import pandas as pd
 from collections import Counter
 import pickle
 import os
+
+# 한국어 처리 라이브러리 (선택적)
+try:
+    from konlpy.tag import Okt, Kkma
+    KONLPY_AVAILABLE = True
+    logger = logging.getLogger(__name__)
+    logger.info("KoNLPy 사용 가능")
+except ImportError as e:
+    Okt = None
+    Kkma = None
+    KONLPY_AVAILABLE = False
+    logger = logging.getLogger(__name__)
+    logger.warning(f"KoNLPy 사용 불가: {str(e)}. 기본 토큰화 사용")
 
 logger = logging.getLogger(__name__)
 
@@ -19,8 +31,19 @@ class TextPreprocessor:
     """텍스트 전처리 클래스"""
     
     def __init__(self):
-        self.okt = Okt()
-        self.kkma = Kkma()
+        # 한국어 처리기 초기화 (사용 가능한 경우에만)
+        if KONLPY_AVAILABLE:
+            try:
+                self.okt = Okt()
+                self.kkma = Kkma()
+                logger.info("한국어 처리기 초기화 완료")
+            except Exception as e:
+                logger.warning(f"한국어 처리기 초기화 실패: {str(e)}")
+                self.okt = None
+                self.kkma = None
+        else:
+            self.okt = None
+            self.kkma = None
         
         # 불용어 리스트 초기화
         self.stopwords = self._load_stopwords()
@@ -133,14 +156,30 @@ class TextPreprocessor:
         if not text:
             return []
         
-        try:
-            # 형태소 분석
-            morphs = self.okt.morphs(text, stem=True)
-            return morphs
-        except Exception as e:
-            logger.error(f"한국어 토큰화 실패: {str(e)}")
-            # 폴백: 간단한 공백 분리
-            return text.split()
+        # KoNLPy 사용 가능한 경우
+        if self.okt is not None:
+            try:
+                # 형태소 분석
+                morphs = self.okt.morphs(text, stem=True)
+                return morphs
+            except Exception as e:
+                logger.error(f"한국어 토큰화 실패: {str(e)}")
+                # 폴백: 간단한 공백 분리
+                return text.split()
+        else:
+            # KoNLPy 사용 불가능한 경우 기본 토큰화
+            logger.warning("KoNLPy 사용 불가, 기본 토큰화 사용")
+            return self._basic_tokenize(text)
+    
+    def _basic_tokenize(self, text: str) -> List[str]:
+        """기본 토큰화 (KoNLPy 없이)"""
+        if not text:
+            return []
+        
+        # 간단한 정규식 기반 토큰화
+        # 한글, 영문, 숫자만 추출
+        tokens = re.findall(r'[가-힣a-zA-Z0-9]+', text)
+        return tokens
     
     def remove_stopwords(self, tokens: List[str]) -> List[str]:
         """불용어 제거"""
